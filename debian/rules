@@ -1,0 +1,16 @@
+#!/usr/bin/make -f
+
+include /usr/share/dpkg/buildflags.mk
+
+%:
+	dh $@
+
+# Pass LDFLAGS on the make command line so upstream's
+# "LDFLAGS := -Wl,-s $(LDFLAGS)" is replaced entirely: dh_strip handles
+# stripping, and std::thread needs an explicit -pthread.
+override_dh_auto_build:
+	dh_auto_build -- LDFLAGS="$(LDFLAGS) -pthread"
+
+# Upstream Makefile has no install target.
+override_dh_auto_install:
+	install -Dm755 tsreadex debian/tsreadex/usr/bin/tsreadex

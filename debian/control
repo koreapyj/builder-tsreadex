@@ -1,0 +1,20 @@
+Source: tsreadex
+Section: video
+Priority: optional
+Maintainer: koreapyj <koreapyj@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13), g++
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+Homepage: https://github.com/xtne6f/tsreadex
+
+Package: tsreadex
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: tool for MPEG-TS stream selection and stabilization
+ tsreadex reads an MPEG-TS stream (typically ARIB/Japanese broadcast
+ transport streams) from a file or pipe and rewrites it: selecting a
+ single service/program, remapping or dropping PIDs, completing or
+ removing caption/superimpose streams, fixing up AAC audio tracks, and
+ smoothing timing so that downstream encoders or streaming pipelines
+ receive a stable feed. It is commonly used as a pre-processing filter
+ in PVR setups such as EPGStation/Mirakurun.

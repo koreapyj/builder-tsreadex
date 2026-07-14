@@ -1,0 +1,188 @@
+name: Build and release tsreadex .deb packages
+
+on:
+  schedule:
+    - cron: '22 3 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: xtne6f/tsreadex
+
+jobs:
+  check:
+    name: Check upstream release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.upstream.outputs.tag }}
+      version: ${{ steps.upstream.outputs.version }}
+      should_build: ${{ steps.decide.outputs.should_build }}
+    steps:
+      - name: Get upstream latest release tag
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag=$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq .tag_name)
+          if [ -z "$tag" ]; then
+            echo "::error::could not determine upstream latest release tag"
+            exit 1
+          fi
+          # Debian upstream versions must start with a digit: master-YYMMDD -> YYMMDD
+          version=${tag#master-}
+          case "$version" in
+            [0-9]*) ;;
+            *) echo "::error::computed version '$version' (from tag '$tag') does not start with a digit"; exit 1 ;;
+          esac
+          echo "Upstream latest tag: $tag -> Debian upstream version: $version"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether this tag is already released here
+        id: decide
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release $TAG already exists on ${{ github.repository }} - nothing to do."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Release $TAG not found on ${{ github.repository }} - will build."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build (${{ matrix.distro }}/${{ matrix.arch }})
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ${{ matrix.image }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [bookworm, bullseye, trixie, jammy, noble, resolute]
+        arch: [amd64, arm64]
+        include:
+          - { distro: bookworm, image: 'debian:bookworm', suffix: deb12 }
+          - { distro: bullseye, image: 'debian:bullseye', suffix: deb11 }
+          - { distro: trixie,   image: 'debian:trixie',   suffix: deb13 }
+          - { distro: jammy,    image: 'ubuntu:jammy',    suffix: ubuntu22.04 }
+          - { distro: noble,    image: 'ubuntu:noble',    suffix: ubuntu24.04 }
+          - { distro: resolute, image: 'ubuntu:resolute', suffix: ubuntu26.04 }
+          - { arch: amd64, runner: ubuntu-latest }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    # Inside containers the runner may fall back to plain sh (dash), which
+    # rejects "set -o pipefail" — force bash for all run steps.
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install git and build tooling
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git ca-certificates build-essential debhelper
+
+      - name: Checkout builder repo (debian/ packaging files)
+        uses: actions/checkout@v4
+        with:
+          path: builder
+
+      - name: Checkout upstream source at ${{ needs.check.outputs.tag }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.check.outputs.tag }}
+          path: src
+          fetch-depth: 1
+
+      - name: Assemble packaging tree
+        run: cp -r builder/debian src/debian
+
+      - name: Generate debian/changelog
+        working-directory: src
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          SUFFIX: ${{ matrix.suffix }}
+          DISTRO: ${{ matrix.distro }}
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          {
+            echo "tsreadex (${VERSION}-1~${SUFFIX}) ${DISTRO}; urgency=medium"
+            echo
+            echo "  * Automated build from upstream tag ${TAG}."
+            echo
+            echo " -- koreapyj <koreapyj@users.noreply.github.com>  $(date -R)"
+          } > debian/changelog
+          cat debian/changelog
+
+      - name: Build .deb
+        working-directory: src
+        run: dpkg-buildpackage -b -us -uc
+
+      - name: Show build output
+        run: ls -la *.deb *.changes
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.distro }}-${{ matrix.arch }}
+          # tsreadex_*.deb excludes tsreadex-dbgsym_*.deb (Debian) — Ubuntu
+          # names debug packages .ddeb, so include only the main package on
+          # both to keep release assets consistent.
+          path: 'tsreadex_*.deb'
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub release
+    needs: [check, build]
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all .deb artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: debs
+          merge-multiple: true
+
+      - name: List collected packages
+        run: ls -la debs
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          notes="Automated Debian/Ubuntu packages of xtne6f/tsreadex ${TAG}.
+
+          Targets: Debian bookworm, bullseye, trixie; Ubuntu jammy, noble, resolute.
+          Architectures: amd64, arm64.
+
+          Built and published automatically by ${{ github.repository }}."
+
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release $TAG already exists (rerun) - uploading/replacing assets."
+            gh release upload "$TAG" debs/*.deb --repo "${{ github.repository }}" --clobber
+          else
+            gh release create "$TAG" debs/*.deb \
+              --repo "${{ github.repository }}" \
+              --title "$TAG" \
+              --notes "$notes"
+          fi
